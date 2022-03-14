@@ -1,6 +1,6 @@
 import json
 import uuid
-from enum import Enum, IntEnum
+from enum import Enum
 from typing import Optional
 
 from fastapi import HTTPException
@@ -42,7 +42,6 @@ def create_user(name: str, leader_card_id: int) -> str:
 
 
 def _get_user_by_token(conn, token: str) -> Optional[SafeUser]:
-    # TODO: 実装
     result = conn.execute(
         text("SELECT `id`, `name`, `leader_card_id` FROM `user` WHERE `token`=:token"),
         {"token": token},
@@ -122,13 +121,31 @@ class ResultUser(BaseModel):
     score: int
 
 
-def room_create(live_id: int, select_difficulty: LiveDifficulty) -> int:
+def room_create(live_id: int, select_difficulty: LiveDifficulty, token: str) -> int:
     with engine.begin() as conn:
         result = conn.execute(
-            text("INSERT INTO `room` (live_id) VALUES (:live_id)"),
-            {"live_id": live_id, "select_difficulty": select_difficulty.value},
+            text(
+                "INSERT INTO `room` (live_id, joined_user_count) VALUES (:live_id, :joined_user_count)"
+            ),
+            dict(
+                live_id=live_id,
+                joined_user_count=1,
+            ),
         )
         room_id = result.lastrowid
+        user_id = get_user_by_token(token).id
+        result = conn.execute(
+            text(
+                "INSERT INTO `room_member` (room_id, user_id, select_difficulty, token, host) VALUES (:room_id, :user_id, :select_difficulty, :token :host)"
+            ),
+            dict(
+                room_id=room_id,
+                user_id=user_id,
+                select_difficulty=select_difficulty.value,
+                token=token,
+                host=user_id,
+            ),
+        )
     return room_id
 
 
@@ -173,12 +190,12 @@ def room_join(
         if user_count < MAX_USER_COUNT:
             result = conn.execute(
                 text(
-                    "UPDATE `room_member` SET `joined_user_count`=:now_user_count WHERE `room_id`=:room_id"
+                    "INSERT INTO `room_member` (room_id, user_id, leader_card_id, select_difficulty) VALUES (:room_id, :user_id, :leader_card_id, :select_difficulty)"
                 ),
                 dict(
                     room_id=room_id,
                     user_id=user.id,
-                    now_user_count=user_count + 1,
+                    leader_card_id=user.leader_card_id,
                     select_difficulty=select_difficulty.value,
                 ),
             )
@@ -192,5 +209,63 @@ def room_join(
             return JoinRoomResult.OtherError
 
 
-def room_wait(room_id: int):
-    pass
+def _get_room_status(conn, room_id: int) -> WaitRoomStatus:
+    result = conn.execute(
+        text("SELECT `status` FROM `room` WHERE `room_id`=:room_id"),
+        dict(room_id=room_id),
+    )
+    result = result.one()
+    if result.status == 1:
+        return WaitRoomStatus.Waiting
+    elif result.status == 2:
+        return WaitRoomStatus.LiveStart
+    elif result.status == 3:
+        return WaitRoomStatus.Dissolution
+    else:
+        # 上記以外の値にはならないと思うが一応追加
+        return WaitRoomStatus.Dissolution
+
+
+def room_host(room_id) -> int:
+    with engine.begin() as conn:
+        result = conn.execute(
+            text("SELECT `host` FROM `room` WHERE `room_id`=:room_id"),
+            dict(room_id=room_id),
+        )
+        try:
+            row = result.one()
+            return row.host
+        except NoResultFound:
+            return None
+
+
+def _get_room_members(conn, room_id: int, token: str):
+    result = conn.execute(
+        text(
+            "SELECT `user_id`, `select_difficulty`, `token` FROM `room_member` WHERE `room_id`=:room_id"
+        ),
+        dict(room_id=room_id),
+    )
+    result = result.all()
+    host: int = room_host(room_id)
+    members = []
+    for row in result:
+        user_info: SafeUser = get_user_by_token(row.token)
+        members.append(
+            RoomUser(
+                user_id=row.user_id,
+                name=user_info.name,
+                leader_card_id=user_info.leader_card_id,
+                select_difficulty=row.select_difficulty,
+                is_me=(token == row.token),
+                is_host=(host == row.user_id),
+            )
+        )
+    return members
+
+
+def room_wait(room_id: int, token: str):
+    with engine.begin() as conn:
+        status = _get_room_status(conn, room_id)
+        members = _get_room_members(conn, room_id, token)
+    return status, members

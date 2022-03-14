@@ -4,5 +4,7 @@ CREATE TABLE `room` (
   `live_id` int DEFAULT 0,
   `joined_user_count` int DEFAULT 0,
   `max_user_count` int DEFAULT 4,
+  `joined_user_count` int DEFAULT 1,
+  `status` int DEFAULT 1,
   PRIMARY KEY (`room_id`)
 );
