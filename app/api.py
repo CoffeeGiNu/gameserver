@@ -5,7 +5,7 @@ from fastapi.security.http import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from . import model
-from .model import SafeUser, RoomInfo
+from .model import JoinRoomResult, LiveDifficulty, RoomInfo, SafeUser
 
 app = FastAPI()
 
@@ -72,7 +72,7 @@ def update(req: UserCreateRequest, token: str = Depends(get_auth_token)):
 
 class RoomCreateRequest(BaseModel):
     live_id: int
-    select_difficulty: int
+    select_difficulty: LiveDifficulty
 
 
 class RoomCreateResponse(BaseModel):
@@ -81,11 +81,11 @@ class RoomCreateResponse(BaseModel):
 
 @app.post("/room/create", response_model=RoomCreateResponse)
 def room_create(req: RoomCreateRequest):
-    room = model.room_create(req.live_id, req.select_difficulty)
-    if room is None:
+    room_id = model.room_create(req.live_id, req.select_difficulty)
+    if room_id is None:
         raise HTTPException(status_code=404)
     # print(f"user_me({token=}, {user=})")
-    return room
+    return RoomCreateResponse(room_id=room_id)
 
 
 class RoomListRequest(BaseModel):
@@ -98,7 +98,22 @@ class RoomListResponse(BaseModel):
 
 @app.post("/room/list", response_model=RoomListResponse)
 def room_list(req: RoomCreateRequest):
-    room = model.room_list(req.live_id)
-    if room is None:
+    available_rooms = model.room_list(req.live_id)
+    if available_rooms is None:
         raise HTTPException(status_code=404)
-    return room
+    return RoomListResponse(room_info_list=available_rooms)
+
+
+class RoomJoinRequest(BaseModel):
+    room_id: int
+    select_difficulty: LiveDifficulty
+
+
+class RoomJoinResponse(BaseModel):
+    join_room_result: JoinRoomResult
+
+
+@app.post("/room/join", response_model=RoomJoinResponse)
+def room_join(req: RoomJoinRequest):
+    join_room_result = model.room_join(req.room_id, req.select_difficulty)
+    return RoomJoinResponse(join_room_result=join_room_result)

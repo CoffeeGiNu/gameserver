@@ -1,9 +1,7 @@
 import json
-from unittest import result
 import uuid
 from enum import Enum, IntEnum
 from typing import Optional
-from xmlrpc.client import boolean
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -133,21 +131,19 @@ def room_create(live_id: int, select_difficulty: LiveDifficulty) -> int:
     return room_id
 
 
-def get_room_list(live_id: int) -> Optional[RoomInfo]:
+def room_list(live_id: int) -> Optional[RoomInfo]:
     with engine.begin() as conn:
         # live_idが0のときは全曲が対象
         if live_id == 0:
             result = conn.execute(
-                text(
-                    "SELECT (room_id, live_id, joined_user_count) FROM `room`"
-                ),
+                text("SELECT (room_id, live_id, joined_user_count) FROM `room`"),
             )
         else:
             result = conn.execute(
                 text(
                     "SELECT (room_id, live_id, joined_user_count) FROM `room` WHERE `live_id`=:live_id"
                 ),
-                {"live_id": live_id}
+                {"live_id": live_id},
             )
         results = result.all
     available_rooms = []
@@ -161,6 +157,29 @@ def get_room_list(live_id: int) -> Optional[RoomInfo]:
     return available_rooms
 
 
-def join_room(room_id: int, select_difficulty: LiveDifficulty) -> JoinRoomResult:
+def room_join(room_id: int, select_difficulty: LiveDifficulty) -> JoinRoomResult:
     with engine.begin() as conn:
-        result
+        result = conn.exetute(
+            text("SELECT `joined_user_count` FROM `room` WHERE `room_id`=:room_id"),
+            {"room_id": room_id},
+        )
+        try:
+            result = result.one()
+        except NoResultFound:
+            return JoinRoomResult.Disbanded
+        user_count = result.joined_user_count
+        if user_count < MAX_USER_COUNT:
+            result = conn.execute(
+                text(
+                    "UPDATE `room` SET `joined_user_count`=:now_user_count WHERE `room_id`=:room_id AND `select_difficulty`=:select_difficulty"
+                ),
+                {
+                    "now_user_count": user_count + 1,
+                    "select_difficulty": select_difficulty,
+                },
+            )
+            return JoinRoomResult.Ok
+        elif user_count >= MAX_USER_COUNT:
+            return JoinRoomResult.RoomFull
+        else:
+            return JoinRoomResult.OtherError
