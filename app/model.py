@@ -112,6 +112,9 @@ class RoomUser(BaseModel):
     is_me: bool
     is_host: bool
 
+    class Config:
+        orm_mode = True
+
 
 class ResultUser(BaseModel):
     user_id: int
@@ -122,9 +125,7 @@ class ResultUser(BaseModel):
 def room_create(live_id: int, select_difficulty: LiveDifficulty) -> int:
     with engine.begin() as conn:
         result = conn.execute(
-            text(
-                "INSERT INTO `room` (live_id, select_difficulty) VALUES (:live_id, :select_difficulty)"
-            ),
+            text("INSERT INTO `room` (live_id) VALUES (:live_id)"),
             {"live_id": live_id, "select_difficulty": select_difficulty.value},
         )
         room_id = result.lastrowid
@@ -136,30 +137,31 @@ def room_list(live_id: int) -> Optional[RoomInfo]:
         # live_idが0のときは全曲が対象
         if live_id == 0:
             result = conn.execute(
-                text("SELECT (room_id, live_id, joined_user_count) FROM `room`"),
+                text("SELECT * FROM `room`"),
             )
         else:
             result = conn.execute(
-                text(
-                    "SELECT (room_id, live_id, joined_user_count) FROM `room` WHERE `live_id`=:live_id"
-                ),
+                text("SELECT * FROM `room` WHERE `live_id`=:live_id"),
                 {"live_id": live_id},
             )
-        results = result.all
+        results = result.fetchall()
     available_rooms = []
     for res in results:
         available_room = RoomInfo(
             room_id=res.room_id,
-            live_id=res.lived_id,
+            live_id=res.live_id,
             joined_user_count=res.joined_user_count,
         )
         available_rooms.append(available_room)
     return available_rooms
 
 
-def room_join(room_id: int, select_difficulty: LiveDifficulty) -> JoinRoomResult:
+def room_join(
+    user: SafeUser, room_id: int, select_difficulty: LiveDifficulty
+) -> JoinRoomResult:
+    # apiの仕様表にはuserについての記載はないがuserの情報は必要そうなので追加
     with engine.begin() as conn:
-        result = conn.exetute(
+        result = conn.execute(
             text("SELECT `joined_user_count` FROM `room` WHERE `room_id`=:room_id"),
             {"room_id": room_id},
         )
@@ -171,15 +173,24 @@ def room_join(room_id: int, select_difficulty: LiveDifficulty) -> JoinRoomResult
         if user_count < MAX_USER_COUNT:
             result = conn.execute(
                 text(
-                    "UPDATE `room` SET `joined_user_count`=:now_user_count WHERE `room_id`=:room_id AND `select_difficulty`=:select_difficulty"
+                    "UPDATE `room_member` SET `joined_user_count`=:now_user_count WHERE `room_id`=:room_id"
                 ),
-                {
-                    "now_user_count": user_count + 1,
-                    "select_difficulty": select_difficulty,
-                },
+                dict(
+                    room_id=room_id,
+                    user_id=user.id,
+                    now_user_count=user_count + 1,
+                    select_difficulty=select_difficulty.value,
+                ),
             )
             return JoinRoomResult.Ok
         elif user_count >= MAX_USER_COUNT:
             return JoinRoomResult.RoomFull
+        elif user_count == 0:
+            # 実際にこの状況がありえるのかわからないが一応用意しておく
+            return JoinRoomResult.Disbanded
         else:
             return JoinRoomResult.OtherError
+
+
+def room_wait(room_id: int):
+    pass

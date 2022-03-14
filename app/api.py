@@ -64,7 +64,7 @@ def update(req: UserCreateRequest, token: str = Depends(get_auth_token)):
     """Update user attributes"""
     # print(req)
     model.update_user(token, req.user_name, req.leader_card_id)
-    return {}
+    return Empty()
 
 
 # Room APIs
@@ -97,7 +97,7 @@ class RoomListResponse(BaseModel):
 
 
 @app.post("/room/list", response_model=RoomListResponse)
-def room_list(req: RoomCreateRequest):
+def room_list(req: RoomListRequest):
     available_rooms = model.room_list(req.live_id)
     if available_rooms is None:
         raise HTTPException(status_code=404)
