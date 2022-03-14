@@ -1,4 +1,5 @@
 import json
+from unittest import result
 import uuid
 from enum import Enum, IntEnum
 from typing import Optional
@@ -132,22 +133,34 @@ def room_create(live_id: int, select_difficulty: LiveDifficulty) -> int:
     return room_id
 
 
-def get_room_list(live_id: int):
-    rooms = []
+def get_room_list(live_id: int) -> Optional[RoomInfo]:
     with engine.begin() as conn:
-        # live_idが0のときはすべての曲のroom対象
+        # live_idが0のときは全曲が対象
         if live_id == 0:
-            
-
-
-def room_list(live_id: int) -> list:
-    # NOTE: tokenが衝突したらリトライする必要がある.
-    with engine.begin() as conn:
-        result = conn.execute(
-            text(
-                "SELECT (room_id, live_id, joined_user_count, max_user_count) FROM `room` WHERE `live_id`=:live_id"
-            ),
-            {"live_id": live_id}
+            result = conn.execute(
+                text(
+                    "SELECT (room_id, live_id, joined_user_count) FROM `room`"
+                ),
+            )
+        else:
+            result = conn.execute(
+                text(
+                    "SELECT (room_id, live_id, joined_user_count) FROM `room` WHERE `live_id`=:live_id"
+                ),
+                {"live_id": live_id}
+            )
+        results = result.all
+    available_rooms = []
+    for res in results:
+        available_room = RoomInfo(
+            room_id=res.room_id,
+            live_id=res.lived_id,
+            joined_user_count=res.joined_user_count,
         )
-    rows = result.all()
-    return RoomInfo.from_orm(rows)
+        available_rooms.append(available_room)
+    return available_rooms
+
+
+def join_room(room_id: int, select_difficulty: LiveDifficulty) -> JoinRoomResult:
+    with engine.begin() as conn:
+        result
