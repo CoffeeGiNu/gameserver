@@ -2,6 +2,7 @@ import json
 import uuid
 from enum import Enum
 from typing import Optional
+from unittest import result
 
 from fastapi import HTTPException
 from pydantic import BaseModel
@@ -108,8 +109,8 @@ class RoomUser(BaseModel):
     name: str
     leader_card_id: int
     select_difficulty: LiveDifficulty
-    is_me: bool
-    is_host: bool
+    is_me: bool = False
+    is_host: bool = False
 
     class Config:
         orm_mode = True
@@ -121,29 +122,24 @@ class ResultUser(BaseModel):
     score: int
 
 
-def room_create(live_id: int, select_difficulty: LiveDifficulty, token: str) -> int:
+def room_create(user: SafeUser, live_id: int, select_difficulty: LiveDifficulty) -> int:
     with engine.begin() as conn:
         result = conn.execute(
             text(
-                "INSERT INTO `room` (live_id, joined_user_count) VALUES (:live_id, :joined_user_count)"
+                "INSERT INTO `room` (live_id, joined_user_count, host) VALUES (:live_id, :joined_user_count, :host)"
             ),
-            dict(
-                live_id=live_id,
-                joined_user_count=1,
-            ),
+            dict(live_id=live_id, joined_user_count=1, host=user.id),
         )
         room_id = result.lastrowid
-        user_id = get_user_by_token(token).id
         result = conn.execute(
             text(
-                "INSERT INTO `room_member` (room_id, user_id, select_difficulty, token, host) VALUES (:room_id, :user_id, :select_difficulty, :token :host)"
+                "INSERT INTO `room_member` (room_id, user_id, select_difficulty, is_host) VALUES (:room_id, :user_id, :select_difficulty, :is_host)"
             ),
             dict(
                 room_id=room_id,
-                user_id=user_id,
+                user_id=user.id,
                 select_difficulty=select_difficulty.value,
-                token=token,
-                host=user_id,
+                is_host=True,
             ),
         )
     return room_id
@@ -176,7 +172,7 @@ def room_list(live_id: int) -> Optional[RoomInfo]:
 def room_join(
     user: SafeUser, room_id: int, select_difficulty: LiveDifficulty
 ) -> JoinRoomResult:
-    # apiの仕様表にはuserについての記載はないがuserの情報は必要そうなので追加
+    # 仕様表にはuserについての記載はないがuserの情報は必要そうなのでarg追加
     with engine.begin() as conn:
         result = conn.execute(
             text("SELECT `joined_user_count` FROM `room` WHERE `room_id`=:room_id"),
@@ -190,7 +186,7 @@ def room_join(
         if user_count < MAX_USER_COUNT:
             result = conn.execute(
                 text(
-                    "INSERT INTO `room_member` (room_id, user_id, leader_card_id, select_difficulty) VALUES (:room_id, :user_id, :leader_card_id, :select_difficulty)"
+                    "INSERT INTO `room_member` (room_id, user_id, select_difficulty) VALUES (:room_id, :user_id, :select_difficulty)"
                 ),
                 dict(
                     room_id=room_id,
@@ -209,63 +205,80 @@ def room_join(
             return JoinRoomResult.OtherError
 
 
-def _get_room_status(conn, room_id: int) -> WaitRoomStatus:
-    result = conn.execute(
-        text("SELECT `status` FROM `room` WHERE `room_id`=:room_id"),
-        dict(room_id=room_id),
-    )
-    result = result.one()
-    if result.status == 1:
-        return WaitRoomStatus.Waiting
-    elif result.status == 2:
-        return WaitRoomStatus.LiveStart
-    elif result.status == 3:
-        return WaitRoomStatus.Dissolution
-    else:
-        # 上記以外の値にはならないと思うが一応追加
-        return WaitRoomStatus.Dissolution
-
-
-def room_host(room_id) -> int:
+def get_status_and_members(room_id: int, user_id: int):
+    # TODO: 後で体裁を整える
     with engine.begin() as conn:
         result = conn.execute(
-            text("SELECT `host` FROM `room` WHERE `room_id`=:room_id"),
+            text("SELECT * FROM `room_member` WHERE `room_id` = :room_id"),
             dict(room_id=room_id),
         )
-        try:
-            row = result.one()
-            return row.host
-        except NoResultFound:
-            return None
+        room_member = []
+        rows = result.fetchall()
 
-
-def _get_room_members(conn, room_id: int, token: str):
-    result = conn.execute(
-        text(
-            "SELECT `user_id`, `select_difficulty`, `token` FROM `room_member` WHERE `room_id`=:room_id"
-        ),
-        dict(room_id=room_id),
-    )
-    result = result.all()
-    host: int = room_host(room_id)
-    members = []
-    for row in result:
-        user_info: SafeUser = get_user_by_token(row.token)
-        members.append(
-            RoomUser(
-                user_id=row.user_id,
-                name=user_info.name,
-                leader_card_id=user_info.leader_card_id,
-                select_difficulty=row.select_difficulty,
-                is_me=(token == row.token),
-                is_host=(host == row.user_id),
-            )
+        result = conn.execute(
+            text("SELECT * FROM `room` WHERE `room_id` = :room_id"),
+            dict(room_id=room_id),
         )
-    return members
+        row = result.one()
+        host = row.host
+        status = row.status
+        for row in rows:
+            is_me = 0
+            is_host = 0
+            if row.user_id == user_id:
+                is_me = 1
+            if row.user_id == host:
+                is_host = 1
+            ures = conn.execute(
+                text("SELECT * FROM `user` WHERE `id` = :user_id"),
+                dict(user_id=row.user_id),
+            )
+            user = ures.one()
+            room_member.append(
+                RoomUser(
+                    user_id=row.user_id,
+                    name=user.name,
+                    leader_card_id=user.leader_card_id,
+                    select_difficulty=LiveDifficulty(row.select_difficulty),
+                    is_me=is_me,
+                    is_host=is_host,
+                )
+            )
+    return status, room_member
 
 
-def room_wait(room_id: int, token: str):
+def room_leave(room_id: int, user_id: int) -> None:
     with engine.begin() as conn:
-        status = _get_room_status(conn, room_id)
-        members = _get_room_members(conn, room_id, token)
-    return status, members
+        result = conn.execute(
+            text("SELECT * FROM `room` WHERE `room_id` = :room_id FOR UPDATE"),
+            {"room_id": room_id},
+        )
+        if result.one().host == user_id:
+            conn.execute(
+                text("UPDATE `room` SET `status` = 3 WHERE `room_id` = :room_id"),
+                {"room_id": room_id},
+            )
+        conn.execute(
+            text(
+                "DELETE FROM `room_member` WHERE `room_id` = :room_id AND `user_id` = :user_id"
+            ),
+            {"room_id": room_id, "user_id": user_id},
+        )
+        result = conn.execute(
+            text("SELECT * FROM `room` WHERE room_id = :room_id"),
+            {"room_id": room_id},
+        )
+        conn.execute(text("COMMIT"))
+        count = result.fetchall()[0].joined_user_count
+        if count == 1:
+            conn.execute(
+                text("DELETE FROM `room` WHERE `room_id` = :room_id"),
+                {"room_id": room_id},
+            )
+        conn.execute(
+            text(
+                "UPDATE `room` SET `joined_user_count` = :dec WHERE room_id = :room_id"
+            ),
+            {"dec": count - 1, "room_id": room_id},
+        )
+    return None
