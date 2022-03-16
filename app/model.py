@@ -1,4 +1,5 @@
 import json
+from re import A
 import uuid
 from enum import Enum
 from typing import Optional
@@ -6,7 +7,7 @@ from unittest import result
 
 from fastapi import HTTPException
 from pydantic import BaseModel
-from sqlalchemy import text
+from sqlalchemy import null, text
 from sqlalchemy.exc import NoResultFound
 
 from .db import engine
@@ -170,39 +171,49 @@ def room_list(live_id: int) -> Optional[RoomInfo]:
 
 
 def room_join(
-    user: SafeUser, room_id: int, select_difficulty: LiveDifficulty
+    room_id: int, select_difficulty: LiveDifficulty, user_id: int
 ) -> JoinRoomResult:
     # 仕様表にはuserについての記載はないがuserの情報は必要そうなのでarg追加
     with engine.begin() as conn:
         result = conn.execute(
-            text("SELECT `joined_user_count` FROM `room` WHERE `room_id`=:room_id"),
+            text("SELECT * FROM `room` WHERE `room_id`=:room_id FOR UPDATE"),
             {"room_id": room_id},
         )
-        try:
-            result = result.one()
-        except NoResultFound:
-            return JoinRoomResult.Disbanded
+        result = result.one()
+        if result is None:
+            conn.execute(text("COMMIT"))
+            return JoinRoomResult.OtherError
         user_count = result.joined_user_count
-        if user_count < MAX_USER_COUNT:
-            result = conn.execute(
+        if user_count >= MAX_USER_COUNT:
+            conn.execute(text("COMMIT"))
+            return JoinRoomResult.RoomFull
+        elif user_count == 0:
+            # 実際にこの状況がありえるのかわからないが一応用意しておく
+            return JoinRoomResult.Disbanded
+        if result.status == 1:
+            conn.execute(
                 text(
                     "INSERT INTO `room_member` (room_id, user_id, select_difficulty) VALUES (:room_id, :user_id, :select_difficulty)"
                 ),
                 dict(
                     room_id=room_id,
-                    user_id=user.id,
-                    leader_card_id=user.leader_card_id,
+                    user_id=user_id,
                     select_difficulty=select_difficulty.value,
                 ),
             )
+            conn.execute(
+                text(
+                    "UPDATE `room` SET joined_user_count=:joined_user_count WHERE `room_id`=:room_id"
+                ),
+                dict(
+                    joined_user_count=user_count + 1,
+                    room_id=room_id,
+                ),
+            )
+            conn.execute(text("COMMIT"))
             return JoinRoomResult.Ok
-        elif user_count >= MAX_USER_COUNT:
-            return JoinRoomResult.RoomFull
-        elif user_count == 0:
-            # 実際にこの状況がありえるのかわからないが一応用意しておく
-            return JoinRoomResult.Disbanded
         else:
-            return JoinRoomResult.OtherError
+            return JoinRoomResult.Disbanded
 
 
 def get_status_and_members(room_id: int, user_id: int):
@@ -229,11 +240,11 @@ def get_status_and_members(room_id: int, user_id: int):
                 is_me = 1
             if row.user_id == host:
                 is_host = 1
-            ures = conn.execute(
+            users = conn.execute(
                 text("SELECT * FROM `user` WHERE `id` = :user_id"),
                 dict(user_id=row.user_id),
             )
-            user = ures.one()
+            user = users.one()
             room_member.append(
                 RoomUser(
                     user_id=row.user_id,
@@ -250,35 +261,136 @@ def get_status_and_members(room_id: int, user_id: int):
 def room_leave(room_id: int, user_id: int) -> None:
     with engine.begin() as conn:
         result = conn.execute(
-            text("SELECT * FROM `room` WHERE `room_id` = :room_id FOR UPDATE"),
-            {"room_id": room_id},
-        )
-        if result.one().host == user_id:
-            conn.execute(
-                text("UPDATE `room` SET `status` = 3 WHERE `room_id` = :room_id"),
-                {"room_id": room_id},
-            )
-        conn.execute(
             text(
-                "DELETE FROM `room_member` WHERE `room_id` = :room_id AND `user_id` = :user_id"
+                "SELECT is_host from room_member WHERE user_id=:user_id AND room_id=:room_id"
             ),
-            {"room_id": room_id, "user_id": user_id},
+            {"user_id": user_id, "room_id": room_id},
+        )
+        is_host = result.one()[0]
+        result = conn.execute(
+            text("DELETE from room_member WHERE user_id=:user_id AND room_id=:room_id"),
+            {"user_id": user_id, "room_id": room_id},
         )
         result = conn.execute(
-            text("SELECT * FROM `room` WHERE room_id = :room_id"),
+            text("SELECT count(user_id) from room_member WHERE room_id = :room_id"),
             {"room_id": room_id},
         )
-        conn.execute(text("COMMIT"))
-        count = result.fetchall()[0].joined_user_count
-        if count == 1:
-            conn.execute(
-                text("DELETE FROM `room` WHERE `room_id` = :room_id"),
-                {"room_id": room_id},
+        joined_user_count = result.one()[0]
+        if joined_user_count == 0:
+            result = conn.execute(
+                text("DELETE from room WHERE room_id = :room_id"),
+                {"joined_user_count": joined_user_count, "room_id": room_id},
             )
-        conn.execute(
-            text(
-                "UPDATE `room` SET `joined_user_count` = :dec WHERE room_id = :room_id"
-            ),
-            {"dec": count - 1, "room_id": room_id},
+        else:
+            result = conn.execute(
+                text(
+                    "UPDATE room\
+                    SET joined_user_count = :joined_user_count \
+                    WHERE room_id = :room_id"
+                ),
+                {"joined_user_count": joined_user_count, "room_id": room_id},
+            )
+            if is_host:
+                result = conn.execute(
+                    text("SELECT user_id from room_member WHERE room_id = :room_id"),
+                    {"room_id": room_id},
+                )
+                next_host_user_id = result.all()[0][0]
+                result = conn.execute(
+                    text(
+                        "UPDATE room_member\
+                        SET is_host = 1 \
+                        WHERE room_id = :room_id AND user_id = :user_id"
+                    ),
+                    {
+                        "room_id": room_id,
+                        "user_id": next_host_user_id,
+                    },
+                )
+    return None
+
+
+def _get_room_by_room_id(conn, room_id):
+    result = conn.execute(
+        text("SELECT * FROM `room` WHERE `room_id`=:room_id"),
+        dict(room_id=room_id),
+    )
+    return result
+
+
+def room_start(room_id: int, user_id: int) -> None:
+    with engine.begin() as conn:
+        result = _get_room_by_room_id(conn, room_id)
+        row = result.one()
+        host = row.host
+        if host != user_id:
+            return
+        result = conn.execute(
+            text("UPDATE `room` SET `status`=:status WHERE `room_id`=:room_id"),
+            dict(status=2, room_id=room_id),
         )
     return None
+
+
+def _set_score(conn, room_id, judge_count_list, score, user_id):
+    conn.execute(
+        text(
+            "UPDATE `room_member` SET judge_perfect=:judge_perfect, judge_great=:judge_great, judge_good=:judge_good, judge_bad=:judge_bad, judge_miss=:judge_miss, score=:score WHERE `room_id`=:room_id AND `user_id`=:user_id"
+        ),
+        dict(
+            judge_perfect=judge_count_list[0],
+            judge_great=judge_count_list[1],
+            judge_good=judge_count_list[2],
+            judge_bad=judge_count_list[3],
+            judge_miss=judge_count_list[4],
+            score=score,
+            room_id=room_id,
+            user_id=user_id,
+        ),
+    )
+
+
+def room_end(room_id, judge_count_list, score, user_id) -> None:
+    with engine.begin() as conn:
+        _set_score(conn, room_id, judge_count_list, score, user_id)
+    return None
+
+
+def room_result(room_id: int) -> list[ResultUser]:
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                "SELECT user_id, judge_perfect, judge_great, judge_good, judge_bad, judge_miss, score FROM `room_member` WHERE room_id=:room_id"
+            ),
+            dict(room_id=room_id),
+        )
+        result_all = result.all()
+        result_user_list = []
+        is_all_result = True
+        for result in result_all:
+            if null == result.score:
+                is_all_result = False
+                return []
+            result_user_list.append(
+                ResultUser(
+                    user_id=result.user_id,
+                    judge_count_list=[
+                        result.judge_perfect,
+                        result.judge_great,
+                        result.judge_good,
+                        result.judge_bad,
+                        result.judge_miss,
+                    ],
+                    score=result.score,
+                )
+            )
+
+        result = conn.execute(
+            text("UPDATE `room` SET `status`=:status WHERE room_id=:room_id"),
+            dict(status=3, room_id=room_id)
+        )
+        conn.execute(text("COMMIT"))
+    if is_all_result:
+        return result_user_list
+    else:
+        return []
